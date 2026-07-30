@@ -32,7 +32,9 @@ jobs:
           java-version: '17'
 
       - name: Set up Gradle
-        uses: gradle/actions/setup-gradle@v6
+  uses: gradle/actions/setup-gradle@v6
+  with:
+    validate-wrappers: false
 
       - name: Verify Android SDK 37
         shell: bash

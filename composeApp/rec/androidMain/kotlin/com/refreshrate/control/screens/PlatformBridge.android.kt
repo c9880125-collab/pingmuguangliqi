@@ -1,1 +1,412 @@
+package com.refreshrate.control.screens
 
+import android.content.Context
+import android.content.Intent
+import android.graphics.drawable.Drawable
+import android.net.Uri
+import android.provider.Settings
+import androidx.compose.runtime.Composable
+import androidx.compose.runtime.LaunchedEffect
+import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.remember
+import androidx.compose.runtime.setValue
+import androidx.compose.ui.graphics.asImageBitmap
+import androidx.compose.ui.graphics.painter.Painter
+import androidx.compose.ui.graphics.painter.BitmapPainter
+import androidx.compose.ui.platform.LocalContext
+import com.refreshrate.control.model.AppInfo
+import com.refreshrate.control.model.DisplayMode
+import com.refreshrate.control.util.AutoOverclockManager
+import com.refreshrate.control.util.PrefsHelper
+import com.refreshrate.control.util.RootUtils
+import com.refreshrate.control.util.RuntimeLog
+import java.util.concurrent.atomic.AtomicLong
+import java.util.concurrent.Executors
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.withContext
+
+private val manualSwitchGeneration = AtomicLong(0)
+private val manualSwitchExecutor = Executors.newSingleThreadExecutor()
+private val refreshTestLogExecutor = Executors.newSingleThreadExecutor()
+
+actual class AppContext(val context: Context)
+
+@Composable
+actual fun rememberAppContext(): AppContext {
+    val ctx = LocalContext.current
+    return remember(ctx) { AppContext(ctx) }
+}
+
+@Composable
+actual fun refreshDisplayData(refreshKey: Int): DisplayData? {
+    val context = LocalContext.current
+    var data by remember { mutableStateOf<DisplayData?>(null) }
+
+    LaunchedEffect(refreshKey) {
+        if (refreshKey > 0) kotlinx.coroutines.delay(300)
+        var modeGroups: List<Pair<String, List<DisplayMode>>> = emptyList()
+        while (true) {
+            try {
+                val nextData = withContext(Dispatchers.IO) {
+                    val authMode = PrefsHelper.getAuthMode(context).ifEmpty { "root" }
+                    val current = AutoOverclockManager.getCurrentMode(context)
+                    if (modeGroups.isEmpty()) {
+                        val modes = AutoOverclockManager.getSupportedModes(context)
+                        modeGroups = AutoOverclockManager.groupByResolution(modes)
+                            .entries.map { it.key to it.value }.toList()
+                    }
+                    DisplayData(current, authMode, modeGroups)
+                }
+                val previous = data
+                val previousMode = previous?.currentMode
+                val nextMode = nextData.currentMode
+                val modeUnchanged = previousMode == null && nextMode == null ||
+                    previousMode != null && nextMode != null &&
+                    previousMode.width == nextMode.width &&
+                    previousMode.height == nextMode.height &&
+                    previousMode.rateInt == nextMode.rateInt &&
+                    previousMode.modeId == nextMode.modeId
+                if (previous == null ||
+                    previous.authMode != nextData.authMode ||
+                    previous.modeGroups !== nextData.modeGroups ||
+                    !modeUnchanged
+                ) {
+                    data = nextData
+                }
+            } catch (e: Exception) {
+            }
+            kotlinx.coroutines.delay(1000)
+        }
+    }
+
+    return data
+}
+
+actual fun applyDisplayMode(authMode: String, mode: DisplayMode, context: AppContext) {
+    val generation = manualSwitchGeneration.incrementAndGet()
+    manualSwitchExecutor.execute {
+        val ctx = context.context
+        try {
+            if (generation != manualSwitchGeneration.get()) return@execute
+
+            // Re-scan immediately before every request. Mode IDs can change after a resolution
+            // switch, hotplug, AOD wake-up or vendor display service restart.
+            val allModes = AutoOverclockManager.getSupportedModes(ctx)
+            val currentHz = AutoOverclockManager.getCurrentRefreshRate(ctx)
+            RuntimeLog.append(
+                ctx,
+                "ManualSwitch",
+                "STRICT_START gen=$generation source=${currentHz}Hz " +
+                    "target=${mode.resolutionLabel}@${mode.rateInt}Hz modes=${allModes.map { it.rateInt }}"
+            )
+
+            val switched = RootUtils.switchRefreshRate(mode, allModes, currentHz) {
+                generation != manualSwitchGeneration.get()
+            }
+            if (generation != manualSwitchGeneration.get()) {
+                RuntimeLog.append(ctx, "ManualSwitch", "CANCELLED gen=$generation target=${mode.rateInt}Hz")
+                return@execute
+            }
+
+            // RootUtils already confirms every intermediate step. Do not replay the whole path
+            // here: repeated outer retries were another source of missed/overwritten steps.
+            var stable = 0
+            var samples = 0
+            var state = RootUtils.readDisplayState()
+            while (samples < 6 && stable < 3) {
+                try {
+                    Thread.sleep(250)
+                } catch (_: InterruptedException) {
+                    Thread.currentThread().interrupt()
+                    break
+                }
+                if (generation != manualSwitchGeneration.get()) return@execute
+                state = RootUtils.readDisplayState()
+                stable = if (state.matchesAppliedMode(mode)) stable + 1 else 0
+                samples += 1
+            }
+            val matched = switched && stable >= 3
+            RuntimeLog.append(
+                ctx,
+                "ManualSwitch",
+                "${if (matched) "SUCCESS" else "FAILED"} gen=$generation " +
+                    "target=${mode.rateInt}Hz switched=$switched samples=$samples stable=$stable " +
+                    "state={${state.summary()}} snapshot=${RootUtils.readDisplaySnapshot()}"
+            )
+        } catch (e: Exception) {
+            android.util.Log.e("PlatformBridge", "applyDisplayMode failed: ${e.message}")
+            RuntimeLog.append(ctx, "ManualSwitch", "failed=${e.message}")
+        }
+    }
+}
+
+actual fun logRefreshRateTest(context: AppContext, event: String, metrics: String) {
+    refreshTestLogExecutor.execute {
+        val ctx = context.context
+        val androidHz = AutoOverclockManager.getCurrentRefreshRate(ctx)
+        val rootState = RootUtils.readDisplayState()
+        RuntimeLog.append(
+            ctx,
+            "RefreshRateTest",
+            "$event${if (metrics.isNotBlank()) " $metrics" else ""} android=${androidHz}Hz root={${rootState.summary()}}"
+        )
+    }
+}
+
+@Composable
+actual fun loadSettingsData(): SettingsData? {
+    val context = LocalContext.current
+    var data by remember { mutableStateOf<SettingsData?>(null) }
+
+    LaunchedEffect(Unit) {
+        try {
+            val authMode = PrefsHelper.getAuthMode(context).ifEmpty { "root" }
+            val rootAvailable = RootUtils.isRootAvailable()
+            val customAppRefresh = PrefsHelper.isCustomAppRefresh(context)
+            data = SettingsData(
+                authMode,
+                rootAvailable,
+                customAppRefresh
+            )
+        } catch (e: Exception) {
+        }
+    }
+
+    return data
+}
+
+actual fun saveAuthMode(context: AppContext, mode: String) {
+    PrefsHelper.setAuthMode(context.context, "root")
+}
+
+actual fun saveCustomAppRefresh(context: AppContext, enabled: Boolean) {
+    PrefsHelper.setCustomAppRefresh(context.context, enabled)
+}
+
+@Composable
+actual fun loadEnabledApps(): List<EnabledAppData> {
+    val context = LocalContext.current
+    var apps by remember { mutableStateOf<List<EnabledAppData>>(emptyList()) }
+
+    LaunchedEffect(Unit) {
+        try {
+            apps = PrefsHelper.getEnabledApps(context).map {
+                val parts = it.third.split(" @ ")
+                val hzStr = when (val rate = parts.getOrNull(1)) {
+                    "自动最高" -> 0
+                    else -> rate?.removeSuffix("Hz")?.toIntOrNull() ?: -1
+                }
+                EnabledAppData(it.first, it.second, it.third, hzStr, true)
+            }
+        } catch (e: Exception) {
+        }
+    }
+
+    return apps
+}
+
+@Composable
+actual fun loadInstalledApps(): List<AppInfo> {
+    val context = LocalContext.current
+    var apps by remember { mutableStateOf<List<AppInfo>>(emptyList()) }
+
+    LaunchedEffect(Unit) {
+        try {
+            apps = PrefsHelper.getInstalledApps(context)
+        } catch (e: Exception) {
+        }
+    }
+
+    return apps
+}
+
+actual fun saveAppConfig(context: AppContext, pkg: String, enabled: Boolean, res: String, hz: Int) {
+    PrefsHelper.setAppConfig(context.context, pkg, enabled, res, hz)
+    // Auto-enable custom_app_refresh when any app is configured
+    if (enabled) {
+        PrefsHelper.setCustomAppRefresh(context.context, true)
+    }
+}
+
+actual fun loadAppConfig(context: AppContext, pkg: String): Triple<Boolean, String, Int> {
+    val enabled = PrefsHelper.isAppEnabled(context.context, pkg)
+    val res = PrefsHelper.getAppRes(context.context, pkg)
+    val hz = PrefsHelper.getAppHz(context.context, pkg)
+    return Triple(enabled, res, hz)
+}
+
+actual fun loadResolutions(context: AppContext): List<String> {
+    return PrefsHelper.getResolutionList(context.context)
+}
+
+actual fun loadHzList(context: AppContext, resolution: String): List<Int> {
+    return PrefsHelper.getHzList(context.context, resolution)
+}
+
+actual fun openAccessibilitySettings(context: AppContext) {
+    try {
+        val intent = Intent(Settings.ACTION_ACCESSIBILITY_SETTINGS).apply {
+            flags = Intent.FLAG_ACTIVITY_NEW_TASK
+        }
+        context.context.startActivity(intent)
+    } catch (e: Exception) {
+    }
+}
+
+actual fun openExternalUrl(context: AppContext, url: String) {
+    try {
+        context.context.startActivity(
+            Intent(Intent.ACTION_VIEW, Uri.parse(url)).apply {
+                flags = Intent.FLAG_ACTIVITY_NEW_TASK
+            }
+        )
+    } catch (e: Exception) {
+        android.util.Log.e("PlatformBridge", "openExternalUrl failed: ${e.message}")
+    }
+}
+
+actual fun getAppVersionName(): String = com.refreshrate.control.BuildConfig.VERSION_NAME
+
+@Composable
+actual fun loadRuntimeLogs(refreshKey: Int): List<String> {
+    val context = LocalContext.current
+    var logs by remember { mutableStateOf<List<String>>(emptyList()) }
+
+    LaunchedEffect(refreshKey) {
+        logs = RuntimeLog.read(context)
+    }
+
+    return logs
+}
+
+actual fun clearRuntimeLogs(context: AppContext) {
+    RuntimeLog.clear(context.context)
+}
+
+actual fun exportRuntimeLogs(context: AppContext) {
+    val logs = RuntimeLog.read(context.context).asReversed().joinToString("\n")
+    val text = logs.ifBlank { "暂无运行日志" }
+    val sendIntent = Intent(Intent.ACTION_SEND).apply {
+        type = "text/plain"
+        putExtra(Intent.EXTRA_SUBJECT, "刷新率运行日志")
+        putExtra(Intent.EXTRA_TEXT, text)
+        flags = Intent.FLAG_ACTIVITY_NEW_TASK
+    }
+    val chooser = Intent.createChooser(sendIntent, "导出运行日志").apply {
+        flags = Intent.FLAG_ACTIVITY_NEW_TASK
+    }
+    context.context.startActivity(chooser)
+}
+
+@Composable
+actual fun loadEnabledAppsWithIcons(): List<EnabledAppData> {
+    return loadEnabledApps()
+}
+
+@Composable
+actual fun loadInstalledAppsWithIcons(): List<AppInfoWithIcon> {
+    val context = LocalContext.current
+    var apps by remember { mutableStateOf<List<AppInfoWithIcon>>(emptyList()) }
+
+    LaunchedEffect(Unit) {
+        try {
+            val pm = context.packageManager
+            val installed = pm.getInstalledApplications(android.content.pm.PackageManager.GET_META_DATA)
+            apps = installed.map { ai ->
+                val icon = try { drawableToPainter(pm.getApplicationIcon(ai)) } catch (e: Exception) { null }
+                AppInfoWithIcon(
+                    name = pm.getApplicationLabel(ai).toString(),
+                    packageName = ai.packageName,
+                    systemApp = ai.flags and android.content.pm.ApplicationInfo.FLAG_SYSTEM != 0,
+                    icon = icon
+                )
+            }.filter { it.packageName != context.packageName }
+                .sortedBy { it.name.lowercase() }
+        } catch (e: Exception) {
+        }
+    }
+
+    return apps
+}
+
+@Composable
+actual fun rememberAppIcon(packageName: String): Painter? {
+    val context = LocalContext.current
+    var icon by remember { mutableStateOf<Painter?>(null) }
+
+    LaunchedEffect(packageName) {
+        try {
+            val pm = context.packageManager
+            val drawable = pm.getApplicationIcon(packageName)
+            icon = drawableToPainter(drawable)
+        } catch (e: Exception) {
+        }
+    }
+
+    return icon
+}
+
+@Composable
+actual fun getEnabledAppCount(): Int {
+    val context = LocalContext.current
+    var count by remember { mutableStateOf(0) }
+
+    LaunchedEffect(Unit) {
+        try {
+            count = PrefsHelper.getEnabledApps(context).size
+        } catch (e: Exception) {
+        }
+    }
+
+    return count
+}
+
+private fun drawableToPainter(drawable: Drawable): Painter? {
+    return try {
+        val bitmap = android.graphics.Bitmap.createBitmap(
+            drawable.intrinsicWidth.coerceAtLeast(1),
+            drawable.intrinsicHeight.coerceAtLeast(1),
+            android.graphics.Bitmap.Config.ARGB_8888
+        )
+        val canvas = android.graphics.Canvas(bitmap)
+        drawable.setBounds(0, 0, canvas.width, canvas.height)
+        drawable.draw(canvas)
+        BitmapPainter(bitmap.asImageBitmap())
+    } catch (e: Exception) {
+        null
+    }
+}
+
+@Composable
+actual fun isAccessibilityServiceEnabled(): Boolean {
+    val context = LocalContext.current
+    var enabled by remember { mutableStateOf(false) }
+
+    LaunchedEffect(Unit) {
+        try {
+            enabled = com.refreshrate.control.util.AccessibilityUtils.isKeepAliveServiceEnabled(context)
+        } catch (e: Exception) {
+        }
+    }
+
+    return enabled
+}
+
+actual fun testRefreshRateSwitch(authMode: String): Boolean {
+    return try {
+        val modes = com.refreshrate.control.util.AutoOverclockManager.getSupportedModes(
+            com.refreshrate.control.MainActivity.instance
+        )
+        if (modes.isEmpty()) {
+            android.util.Log.w("TestSwitch", "No modes available")
+            return false
+        }
+        val mode = modes.first()
+        android.util.Log.d("TestSwitch", "Testing: ${mode.width}x${mode.height} @ ${mode.rateInt}Hz, sfIndex=${mode.sfIndex}")
+        com.refreshrate.control.util.RootUtils.setDisplayMode(mode.width, mode.height, mode.rateInt, mode.sfIndex)
+    } catch (e: Exception) {
+        android.util.Log.e("TestSwitch", "Test failed: ${e.message}")
+        false
+    }
+}

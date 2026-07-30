@@ -17,72 +17,55 @@ concurrency:
 
 jobs:
   build-debug-apk:
-    name: Build Debug APK
+    name: Build debug APK
     runs-on: ubuntu-24.04
     timeout-minutes: 30
 
     steps:
       - name: Checkout source
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
 
       - name: Set up JDK 17
         uses: actions/setup-java@v5
         with:
           distribution: temurin
-          java-version: "17"
+          java-version: '17'
 
       - name: Set up Gradle
         uses: gradle/actions/setup-gradle@v6
-        with:
-          validate-wrappers: false
 
       - name: Verify Android SDK 37
         shell: bash
         run: |
-          set -euxo pipefail
+          set -euo pipefail
           echo "ANDROID_HOME=${ANDROID_HOME:-}"
           sdkmanager --version
           if [ ! -d "${ANDROID_HOME}/platforms/android-37" ]; then
             yes | sdkmanager --licenses >/dev/null || true
-            sdkmanager \
-              "platforms;android-37" \
-              "platform-tools" \
-              "build-tools;37.0.0"
+            sdkmanager "platforms;android-37" "build-tools;37.0.0" "platform-tools"
           fi
 
       - name: Make Gradle wrapper executable
-        shell: bash
-        run: |
-          chmod +x gradlew
-          sed -i 's/\r$//' gradlew
-          ls -l gradlew
-          file gradlew
-
-      - name: Test Gradle
-        shell: bash
-        run: |
-          ./gradlew --version
+        run: chmod +x gradlew
 
       - name: Build debug APK
-        shell: bash
-        run: |
-          ./gradlew assembleDebug --stacktrace --no-daemon
+        run: ./gradlew :composeApp:assembleDebug --no-daemon --stacktrace
 
       - name: Prepare artifact
         shell: bash
         run: |
+          set -euo pipefail
           mkdir -p github-artifact
-          APK=$(find . -type f -name "*.apk" | head -n 1)
-          if [ -z "$APK" ]; then
-            echo "APK not found"
-            exit 1
-          fi
-          cp "$APK" github-artifact/app-debug.apk
+          APK="$(find composeApp/build/outputs/apk/debug -maxdepth 1 -type f -name '*.apk' | head -n 1)"
+          test -n "$APK"
+          cp "$APK" github-artifact/RefreshRateManager-1.2.0-debug.apk
+          (cd github-artifact && sha256sum RefreshRateManager-1.2.0-debug.apk > RefreshRateManager-1.2.0-debug.apk.sha256)
+          ls -lh github-artifact
 
       - name: Upload APK
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
-          name: app-debug
-          path: github-artifact/app-debug.apk
+          name: RefreshRateManager-1.2.0-debug
+          path: github-artifact/*
           if-no-files-found: error
           retention-days: 14

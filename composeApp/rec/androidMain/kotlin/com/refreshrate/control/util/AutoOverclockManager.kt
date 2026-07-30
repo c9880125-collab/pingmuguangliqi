@@ -1,0 +1,132 @@
+package com.refreshrate.control.util
+
+import android.content.Context
+import android.hardware.display.DisplayManager
+import android.util.Log
+import com.refreshrate.control.model.DisplayMode
+
+object AutoOverclockManager {
+    private const val TAG = "AutoOverclock"
+
+    fun getSupportedModes(context: Context): List<DisplayMode> {
+        val prefs = context.getSharedPreferences("s", Context.MODE_PRIVATE)
+        val authMode = prefs.getString("auth_mode", "") ?: ""
+
+        val modes = when (authMode.ifEmpty { "root" }) {
+            "root" -> RootUtils.scanModesFromDumpsys()
+            else -> {
+                try {
+                    val dm = context.getSystemService(Context.DISPLAY_SERVICE) as DisplayManager
+                    val display = dm.getDisplay(0)
+                    val displayModes = display.supportedModes ?: return emptyList()
+
+                    val seen = mutableSetOf<String>()
+                    displayModes.mapIndexed { i, m ->
+                        val key = "${m.physicalWidth}x${m.physicalHeight}@${m.refreshRate.toInt()}"
+                        if (seen.add(key)) {
+                            val dm2 = DisplayMode(m.physicalWidth, m.physicalHeight, m.refreshRate, m.modeId)
+                            dm2.sfIndex = m.modeId - 1
+                            dm2
+                        } else null
+                    }.filterNotNull()
+                } catch (e: Exception) {
+                    Log.e(TAG, "getSupportedModes fallback: ${e.message}")
+                    emptyList()
+                }
+            }
+        }
+
+        if (modes.isEmpty()) {
+            try {
+                val dm = context.getSystemService(Context.DISPLAY_SERVICE) as DisplayManager
+                val display = dm.getDisplay(0)
+                val displayModes = display.supportedModes ?: return emptyList()
+
+                val seen = mutableSetOf<String>()
+                return normalizeModes(displayModes.map { m ->
+                    val key = "${m.physicalWidth}x${m.physicalHeight}@${m.refreshRate.toInt()}"
+                    if (seen.add(key)) {
+                        val dm2 = DisplayMode(m.physicalWidth, m.physicalHeight, m.refreshRate, m.modeId)
+                        dm2.sfIndex = m.modeId - 1
+                        dm2
+                    } else null
+                }.filterNotNull())
+            } catch (e: Exception) {
+                return emptyList()
+            }
+        }
+
+        return normalizeModes(modes).also { normalized ->
+            RuntimeLog.appendGlobal(
+                TAG,
+                "MODE_SCAN count=${normalized.size} byResolution=${normalized.groupBy { it.resolutionLabel }.mapValues { (_, values) -> values.maxOf { it.rateInt } }}"
+            )
+        }
+    }
+
+    private fun normalizeModes(modes: List<DisplayMode>): List<DisplayMode> {
+        return modes
+            .filter { it.width > 0 && it.height > 0 && it.rateInt in 30..300 }
+            .distinctBy { Triple(it.width, it.height, it.rateInt) }
+            .sortedWith(compareBy<DisplayMode> { it.width }.thenBy { it.height }.thenBy { it.rateInt })
+    }
+
+    fun getCurrentMode(context: Context): DisplayMode? {
+        try {
+            val prefs = context.getSharedPreferences("s", Context.MODE_PRIVATE)
+            val authMode = prefs.getString("auth_mode", "") ?: ""
+            if (authMode.ifEmpty { "root" } == "root") {
+                val state = RootUtils.readDisplayState()
+                val actualHz = state.activeHz ?: state.driverHz ?: state.physicalHz
+                if (actualHz != null) {
+                    val dm = context.getSystemService(Context.DISPLAY_SERVICE) as DisplayManager
+                    val androidMode = dm.getDisplay(0).mode
+                    val modeId = state.activeModeId ?: androidMode.modeId
+                    return DisplayMode(
+                        state.activeWidth ?: androidMode.physicalWidth,
+                        state.activeHeight ?: androidMode.physicalHeight,
+                        actualHz.toFloat(),
+                        modeId
+                    ).apply {
+                        sfIndex = modeId - 1
+                    }
+                }
+            }
+        } catch (e: Exception) {
+            Log.e(TAG, "getCurrentMode root state fallback: ${e.message}")
+        }
+        return try {
+            val dm = context.getSystemService(Context.DISPLAY_SERVICE) as DisplayManager
+            val display = dm.getDisplay(0)
+            val m = display.mode
+            DisplayMode(m.physicalWidth, m.physicalHeight, m.refreshRate, m.modeId)
+        } catch (e: Exception) {
+            null
+        }
+    }
+
+    fun getCurrentRefreshRate(context: Context): Int {
+        return try {
+            val state = RootUtils.readDisplayState()
+            state.activeHz
+                ?: state.driverHz
+                ?: state.physicalHz
+                ?: run {
+                    val dm = context.getSystemService(Context.DISPLAY_SERVICE) as DisplayManager
+                    Math.round(dm.getDisplay(0).refreshRate)
+                }
+        } catch (e: Exception) {
+            try {
+                val dm = context.getSystemService(Context.DISPLAY_SERVICE) as DisplayManager
+                Math.round(dm.getDisplay(0).refreshRate)
+            } catch (_: Exception) {
+                -1
+            }
+        }
+    }
+
+    fun groupByResolution(modes: List<DisplayMode>): Map<String, List<DisplayMode>> {
+        return modes.groupBy { it.resolutionLabel }
+            .toSortedMap(compareByDescending<String> { it.split("x")[0].toIntOrNull() ?: 0 })
+    }
+}

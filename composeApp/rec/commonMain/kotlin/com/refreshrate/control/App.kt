@@ -134,4 +134,64 @@ fun App() {
                             onBack = { navigationStack.removeAt(navigationStack.lastIndex) }
                         )
                         SubScreen.About -> AboutScreen(
-                
+                            onBack = { navigationStack.removeAt(navigationStack.lastIndex) }
+                        )
+                    }
+                }
+            }
+        }
+    }
+}
+
+@Composable
+private fun MainScaffold(
+    currentTab: Int,
+    onTabChange: (Int) -> Unit,
+    onNavigateToAppList: () -> Unit,
+    onNavigateToAppConfig: (String, String) -> Unit,
+    onNavigateToLogs: () -> Unit,
+    onNavigateToRefreshTest: () -> Unit,
+    onNavigateToAbout: () -> Unit,
+    backdrop: top.yukonga.miuix.kmp.blur.LayerBackdrop,
+) {
+    val items = listOf(
+        NavigationItem("首页", MiuixIcons.Refresh),
+        NavigationItem("应用", MiuixIcons.VerticalSplit),
+        NavigationItem("设置", MiuixIcons.Settings)
+    )
+    Box(
+        modifier = Modifier.fillMaxSize()
+    ) {
+        when (currentTab) {
+            0 -> HomeScreen(
+                modifier = Modifier.fillMaxSize(),
+                onNavigateToTab = { onTabChange(1) }
+            )
+            1 -> CustomAppScreen(
+                modifier = Modifier.fillMaxSize(),
+                onNavigateToAppList = onNavigateToAppList,
+                onNavigateToAppConfig = onNavigateToAppConfig
+            )
+            2 -> SettingsScreen(
+                modifier = Modifier.fillMaxSize(),
+                onNavigateToLogs = onNavigateToLogs,
+                onNavigateToRefreshTest = onNavigateToRefreshTest,
+                onNavigateToAbout = onNavigateToAbout,
+            )
+            }
+
+        Box(
+            modifier = Modifier
+                .align(Alignment.BottomCenter)
+                .fillMaxWidth(),
+            contentAlignment = Alignment.BottomCenter,
+        ) {
+            IosGlassNavigationBar(
+                items = items,
+                selectedIndex = currentTab,
+                onItemClick = onTabChange,
+                backdrop = backdrop,
+            )
+        }
+    }
+}
